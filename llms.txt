@@ -1,0 +1,116 @@
+# llms.txt — Project Stack Context for Claude
+
+> This file gives an AI coding agent (Claude Code / Claude in chat) the context
+> needed to work correctly in this repo without re-deriving the stack from
+> scratch each session. Keep it up to date as the stack changes.
+
+## Framework & Runtime
+
+- **React Router 8** (framework mode, not the old Remix split) — routing,
+  loaders/actions, SSR. Released June 2026 on RR's new yearly major cadence.
+  Older code in this project may still reference RR7 patterns during migration.
+- RR8 is **ESM-only** and targets **ES2022** at the tsconfig level.
+- Node **22+** required (RR8 dropped Node 20 support at Node 20 EOL).
+- RR8 removed all `future.v8_*` flags — behaviors are now defaults. If you're
+  writing new code, don't add `future` flags for anything v8-prefixed.
+- CSRF: RR8's CSRF check reads the host from the request URL, not HTTP headers.
+  Behind a reverse proxy that rewrites the host, you may need
+  `allowedActionOrigins` in the top-level config.
+- Runtime target is **one of**:
+  - Node custom server (from `remix-run/react-router-templates/node-custom-server`), or
+  - **Cloudflare Workers** (via `create-cloudflare --framework=react-router`),
+    using `context.cloudflare.env` for bindings/secrets — never `process.env`
+    at the top level, since Workers isolates don't allow that pattern reliably.
+- Package manager: prefer **bun** where a bunfile/lock exists; otherwise npm.
+  Prisma-related installs (`prisma`, `tsx`, `@types/pg`, `@prisma/client`,
+  `@prisma/adapter-pg`, `dotenv`, `pg`) were originally installed via bun.
+- **Local docs**: RR8 ships markdown docs at `node_modules/react-router/docs`
+  — Claude/agents can read them locally instead of fetching from the web.
+
+## Data Layer
+
+- **PostgreSQL** via **Prisma** with the **driver adapter** (`@prisma/adapter-pg`),
+  not the default Prisma engine binary — required for Cloudflare Workers
+  compatibility.
+- Prisma client output is generated to `app/generated/prisma` (not
+  `node_modules/.prisma`), configured via `generator client { output = ... }`
+  in `prisma/schema.prisma`.
+- Expect an `app/prisma.server.ts` that exports `getPrisma(databaseUrl)`,
+  memoizing a client per connection string (mirrors the auth memoization
+  pattern below).
+- Cloudflare R2 (object storage) and KV are used for file storage / caching
+  where applicable — reach for these instead of local filesystem writes.
+
+## Auth
+
+- **Better Auth**, not NextAuth/Clerk/Auth.js.
+- Server: `app/auth.server.ts` — a per-request/per-isolate factory
+  (`buildAuth(env)`) memoized in a `Map` keyed by connection string + base
+  URL. Do NOT create a top-level singleton `betterAuth({...})` call outside
+  a function — it breaks on Workers where env is only available per-request.
+- Client: `app/auth-client.ts` — `createAuthClient` from `better-auth/react`,
+  same-origin (`/api/auth/*`), magic-link plugin enabled.
+- Schema (`User`, `Session`, `Account`, `Verification`) is Better-Auth's
+  expected shape, mapped to lowercase table names (`@@map("user")` etc).
+
+## Content / Editor
+
+- **Lexical** (`lexical`, `@lexical/react`) is the rich text editor —
+  not TipTap, not Slate.
+- Sanitize any HTML derived from Lexical output with **DOMPurify**
+  (`dompurify` + `jsdom` for server-side sanitization, since DOMPurify needs
+  a DOM implementation outside the browser).
+
+## Styling / UI
+
+- **Tailwind CSS v4** (CSS-first config via `@import "tailwindcss" source(".")`,
+  `@theme`, no `tailwind.config.js` unless there's a specific reason).
+- **DaisyUI v5** as a Tailwind plugin (`@plugin "daisyui"`), with a custom
+  dark theme named `remix` defined via `@plugin "daisyui/theme"`.
+- **Motion** (the `motion` package, formerly Framer Motion) for animation —
+  not `framer-motion` directly.
+- Client state: **Zustand** (lightweight, not Redux).
+
+## Validation
+
+- **Zod** for all schema validation — form input, loader/action payloads,
+  environment variable parsing.
+
+## Payments
+
+- **Stripe**: `stripe` npm package (server SDK) + Stripe CLI (`@stripe/cli`
+  or platform-native install) for local webhook forwarding and ad-hoc API
+  calls during development. Never hardcode live keys; read from `.env`
+  (`STRIPE_SECRET_KEY`) or Worker bindings.
+
+## Email
+
+- **Resend** (`resend` package) for transactional email (magic links,
+  contact form notifications, etc). `RESEND_API_KEY` in `.env`.
+
+## 3D / Creative Coding (when applicable)
+
+- **Three.js** (`three`) for any 3D/WebGL work — particle systems, GLSL
+  shader-driven color palettes, etc. This is sometimes exploratory/hobby
+  work rather than core product surface — check the route/component context
+  before assuming it needs production-grade error handling.
+
+## Security Conventions
+
+- Loader/action code should follow OWASP-mapped conventions established in
+  project security skills (`rr7-cf-security-loaders-actions`,
+  `rr7-cf-security-rendering`, `rr7-cf-security-platform`) if present in
+  `.claude/skills` or `/mnt/skills` — check for these before writing new
+  data-access code.
+- Sanitize all user-generated HTML before render (DOMPurify).
+- Secrets only via `context.cloudflare.env` (Workers) or `process.env`
+  (Node custom server) — never commit `.env`.
+
+## What NOT to assume
+
+- Do not introduce Next.js patterns (`getServerSideProps`, `app/` router
+  conventions from Next) — this is React Router 7, not Next.js.
+- Do not swap Better Auth for another auth library without being asked.
+- Do not switch Prisma to the default engine (non-adapter) mode — it breaks
+  Workers deployment.
+- Do not add Redux — Zustand is the standard here.
