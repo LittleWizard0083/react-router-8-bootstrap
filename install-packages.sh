@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install-packages.sh — Package installation only (no Prisma dev server)
+# install-packages.sh — Package installation with automatic Prisma dev
 #
-# This script installs npm/bun packages without attempting to start the
-# Prisma development database server. Use this when:
-#   - You want to install packages independently
-#   - You're providing your own DATABASE_URL (via `bunx prisma dev`)
-#   - You want to skip database setup and manage it separately
+# This script:
+#   1. Starts `bunx prisma dev` in the background (or foreground if requested)
+#   2. Installs all npm/bun packages
+#   3. Extracts and saves DATABASE_URL + SHADOW_DATABASE_URL to .env
+#   4. Runs prisma migrate and generate
 #
 # Usage:
-#   ./install-packages.sh              # uses npm
-#   ./install-packages.sh bun          # uses bun (recommended)
+#   ./install-packages.sh              # starts prisma dev in background
+#   ./install-packages.sh --foreground # runs prisma dev in foreground (terminal 1)
+#   ./install-packages.sh --skip-db    # skips prisma dev entirely
 #
 # ==============================================================================
 set -euo pipefail
@@ -118,17 +119,127 @@ install_dep_bun() {
   fi
 }
 
+# ensure_env_var: Add key=value to .env if not present
+ensure_env_var() {
+  local key="$1"; local value="$2"
+  touch .env
+  if grep -q -E "^${key}=" .env 2>/dev/null; then
+    skip ".env already has $key"
+  else
+    echo "${key}=${value}" >> .env
+    log "added $key to .env"
+  fi
+}
+
+# replace_env_var: Force-write key=value to .env, removing any existing line
+replace_env_var() {
+  local key="$1"; local value="$2"
+  touch .env
+  if grep -qE "^${key}=" .env; then
+    grep -v -E "^${key}=" .env > .env.tmp || true
+    mv .env.tmp .env
+  fi
+  echo "${key}=${value}" >> .env
+  log "set $key in .env"
+}
+
 # Verify prerequisites
 require_cmd node
 require_cmd npm
 
-banner "Package Installation" "React Router 8 stack"
+banner "Package Installation + Prisma Setup" "React Router 8 stack"
 
 # Check for package.json
 if [[ ! -f package.json ]]; then
   err "package.json not found in $(pwd)"
   err "Run this script in your React Router project directory."
   exit 1
+fi
+
+# Parse command-line arguments
+PRISMA_MODE="background"  # default: background
+case "${1:-}" in
+  --foreground)
+    PRISMA_MODE="foreground"
+    ;;
+  --skip-db)
+    PRISMA_MODE="skip"
+    ;;
+  *)
+    ;;
+esac
+
+# ---------- Start Prisma dev (if not skipped) -----
+if [[ "$PRISMA_MODE" != "skip" ]]; then
+  group "Starting Prisma development database"
+  
+  if [[ "$PRISMA_MODE" == "foreground" ]]; then
+    log "Starting 'bunx prisma dev' in foreground..."
+    log "Copy the DATABASE_URL and SHADOW_DATABASE_URL from the output below."
+    log "When ready, Ctrl+C and run: ./install-packages.sh --skip-db"
+    echo ""
+    if command -v bun >/dev/null 2>&1; then
+      bunx prisma dev
+    else
+      npx prisma dev
+    fi
+    exit 0
+  else
+    # Background mode
+    log "Starting 'bunx prisma dev' in background..."
+    
+    # Create a named pipe to capture output
+    local logfile="/tmp/prisma-dev-$$.log"
+    
+    if command -v bun >/dev/null 2>&1; then
+      bunx prisma dev > "$logfile" 2>&1 &
+    else
+      npx prisma dev > "$logfile" 2>&1 &
+    fi
+    
+    local prisma_pid=$!
+    echo "$prisma_pid" > .prisma-dev.pid
+    
+    # Wait for DATABASE_URL to appear in logs
+    local timeout=60
+    local db_url=""
+    local shadow_url=""
+    
+    log "Waiting for Prisma to start (timeout: ${timeout}s)..."
+    
+    while (( timeout > 0 )); do
+      if [[ -f "$logfile" ]]; then
+        # Try to extract DATABASE_URL
+        if [[ -z "$db_url" ]] && grep -q 'DATABASE_URL=' "$logfile"; then
+          db_url=$(grep 'DATABASE_URL=' "$logfile" | head -1 | sed 's/.*DATABASE_URL="//' | sed 's/".*//')
+        fi
+        # Try to extract SHADOW_DATABASE_URL
+        if [[ -z "$shadow_url" ]] && grep -q 'SHADOW_DATABASE_URL=' "$logfile"; then
+          shadow_url=$(grep 'SHADOW_DATABASE_URL=' "$logfile" | head -1 | sed 's/.*SHADOW_DATABASE_URL="//' | sed 's/".*//')
+        fi
+        
+        # If both found, we're good
+        if [[ -n "$db_url" ]] && [[ -n "$shadow_url" ]]; then
+          ok "Prisma database started (PID: $prisma_pid)"
+          replace_env_var "DATABASE_URL" "$db_url"
+          replace_env_var "SHADOW_DATABASE_URL" "$shadow_url"
+          break
+        fi
+      fi
+      
+      sleep 1
+      ((timeout--))
+    done
+    
+    if (( timeout == 0 )); then
+      warn "Prisma startup timeout. Showing last 20 lines from log:"
+      tail -20 "$logfile" >&2
+      rm -f "$logfile"
+      exit 1
+    fi
+    
+    rm -f "$logfile"
+  fi
 fi
 
 group "Installing packages"
@@ -172,28 +283,48 @@ else
   warn "@prisma/client not found"
 fi
 
+# ---------- Database migration ----------------------------------
+if [[ "$PRISMA_MODE" != "skip" ]] && grep -qE '^DATABASE_URL=postgres' .env 2>/dev/null; then
+  group "Running database migrations"
+  
+  log "Running prisma migrate dev --name init..."
+  if command -v bun >/dev/null 2>&1; then
+    bunx prisma migrate dev --name init || warn "prisma migrate failed"
+  else
+    npx prisma migrate dev --name init || warn "prisma migrate failed"
+  fi
+  
+  log "Running prisma generate..."
+  if command -v bun >/dev/null 2>&1; then
+    bunx prisma generate || warn "prisma generate failed"
+  else
+    npx prisma generate || warn "prisma generate failed"
+  fi
+fi
+
 echo ""
-printf "  %s%s%s\n" "$c_green" "✔ Package installation complete!" "$c_reset"
+printf "  %s%s%s\n" "$c_green" "✔ Setup complete!" "$c_reset"
 echo ""
-echo "  Next steps:"
 echo "  ────────────────────────────────────────────"
-echo "  1. Start Prisma local database (in a separate terminal):"
-echo "     bunx prisma dev"
+echo "  ✓ Packages installed"
+if [[ "$PRISMA_MODE" != "skip" ]]; then
+  echo "  ✓ Prisma database running"
+  echo "  ✓ DATABASE_URL saved to .env"
+fi
 echo ""
-echo "  2. Copy the connection strings from the output above:"
-echo "     DATABASE_URL=\"postgres://...\""
-echo "     SHADOW_DATABASE_URL=\"postgres://...\""
+echo "  Remaining tasks:"
+echo "  ────────────────────────────────────────────"
+echo "  1. Fill in .env with:"
+echo "     - BETTER_AUTH_SECRET (run: openssl rand -base64 32)"
+echo "     - RESEND_API_KEY"
+echo "     - STRIPE_SECRET_KEY"
 echo ""
-echo "  3. Add them to your .env file:"
-echo "     echo 'DATABASE_URL=\"<paste-here>\"' >> .env"
-echo "     echo 'SHADOW_DATABASE_URL=\"<paste-here>\"' >> .env"
+echo "  2. Keep Prisma dev running in background:"
+if [[ -f .prisma-dev.pid ]]; then
+  echo "     PID: $(cat .prisma-dev.pid)"
+fi
+echo "     (or restart with: bunx prisma dev)"
 echo ""
-echo "  4. Then run the database setup:"
-echo "     bunx prisma migrate dev --name init"
-echo "     bunx prisma generate"
-echo ""
-echo "  5. Fill in remaining .env variables:"
-echo "     BETTER_AUTH_SECRET (run: openssl rand -base64 32)"
-echo "     RESEND_API_KEY"
-echo "     STRIPE_SECRET_KEY"
+echo "  3. Start your app:"
+echo "     npm run dev"
 echo ""
