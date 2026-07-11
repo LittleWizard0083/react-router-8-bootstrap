@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# install-packages.sh — Package installation with automatic Prisma dev
+# install-packages.sh — Full React Router 8 setup with scaffolding + packages
 #
 # This script:
-#   1. Starts `bunx prisma dev` in the background (or foreground if requested)
-#   2. Installs all npm/bun packages
-#   3. Extracts and saves DATABASE_URL + SHADOW_DATABASE_URL to .env
-#   4. Runs prisma migrate and generate
+#   1. Scaffolds a React Router 8 project (if package.json doesn't exist)
+#   2. Starts `bunx prisma dev` in the background
+#   3. Installs all npm/bun packages
+#   4. Extracts and saves DATABASE_URL + SHADOW_DATABASE_URL to .env
+#   5. Runs prisma migrate and generate
 #
 # Usage:
-#   ./install-packages.sh              # starts prisma dev in background
-#   ./install-packages.sh --foreground # runs prisma dev in foreground (terminal 1)
-#   ./install-packages.sh --skip-db    # skips prisma dev entirely
+#   ./install-packages.sh              # scaffold + start prisma in background
+#   ./install-packages.sh --foreground # scaffold + run prisma in foreground
+#   ./install-packages.sh --skip-db    # scaffold + skip prisma entirely
+#   ./install-packages.sh --skip-scaffold # skip scaffold, just install packages
 #
 # ==============================================================================
 set -euo pipefail
@@ -147,16 +149,10 @@ replace_env_var() {
 require_cmd node
 require_cmd npm
 
-banner "Package Installation + Prisma Setup" "React Router 8 stack"
-
-# Check for package.json
-if [[ ! -f package.json ]]; then
-  err "package.json not found in $(pwd)"
-  err "Run this script in your React Router project directory."
-  exit 1
-fi
+banner "React Router 8 Complete Setup" "Scaffold + Packages + Prisma"
 
 # Parse command-line arguments
+SCAFFOLD_SKIP=false
 PRISMA_MODE="background"  # default: background
 case "${1:-}" in
   --foreground)
@@ -165,11 +161,45 @@ case "${1:-}" in
   --skip-db)
     PRISMA_MODE="skip"
     ;;
+  --skip-scaffold)
+    SCAFFOLD_SKIP=true
+    ;;
   *)
     ;;
 esac
 
-# ---------- Start Prisma dev (if not skipped) -----
+# ---------- 1. Scaffold React Router (if needed) -----
+if [[ "$SCAFFOLD_SKIP" == false ]] && [[ ! -f package.json ]]; then
+  group "Scaffolding React Router 8 project"
+  
+  log "Running: npx create-react-router@latest . --template remix-run/react-router-templates/node-custom-server"
+  
+  if npx create-react-router@latest . --template remix-run/react-router-templates/node-custom-server; then
+    ok "React Router template scaffolded successfully"
+  else
+    warn "Scaffold installer exited non-zero — checking if template files were created..."
+    if [[ ! -f package.json ]]; then
+      err "Scaffold failed: package.json not created."
+      err "Try manually: npx create-react-router@latest . --template remix-run/react-router-templates/node-custom-server"
+      exit 1
+    fi
+    ok "Template files created despite exit code"
+  fi
+elif [[ -f package.json ]]; then
+  skip "package.json already exists — skipping scaffold"
+else
+  skip "Scaffold skipped (--skip-scaffold flag)"
+fi
+
+# If node_modules is missing, run npm install for base template deps
+if [[ ! -d node_modules ]] || [[ -z "$(ls -A node_modules 2>/dev/null)" ]]; then
+  log "node_modules missing — running npm install for base template deps..."
+  npm install
+else
+  skip "node_modules already populated"
+fi
+
+# ---------- 2. Start Prisma dev (if not skipped) -----
 if [[ "$PRISMA_MODE" != "skip" ]]; then
   group "Starting Prisma development database"
   
@@ -188,7 +218,7 @@ if [[ "$PRISMA_MODE" != "skip" ]]; then
     # Background mode
     log "Starting 'bunx prisma dev' in background..."
     
-    # Create a named pipe to capture output
+    # Create a log file to capture output
     local logfile="/tmp/prisma-dev-$$.log"
     
     if command -v bun >/dev/null 2>&1; then
@@ -283,7 +313,7 @@ else
   warn "@prisma/client not found"
 fi
 
-# ---------- Database migration ----------------------------------
+# ---------- 3. Database migration ----------------------------------
 if [[ "$PRISMA_MODE" != "skip" ]] && grep -qE '^DATABASE_URL=postgres' .env 2>/dev/null; then
   group "Running database migrations"
   
@@ -306,6 +336,7 @@ echo ""
 printf "  %s%s%s\n" "$c_green" "✔ Setup complete!" "$c_reset"
 echo ""
 echo "  ────────────────────────────────────────────"
+echo "  ✓ React Router scaffolded"
 echo "  ✓ Packages installed"
 if [[ "$PRISMA_MODE" != "skip" ]]; then
   echo "  ✓ Prisma database running"
@@ -319,12 +350,15 @@ echo "     - BETTER_AUTH_SECRET (run: openssl rand -base64 32)"
 echo "     - RESEND_API_KEY"
 echo "     - STRIPE_SECRET_KEY"
 echo ""
-echo "  2. Keep Prisma dev running in background:"
-if [[ -f .prisma-dev.pid ]]; then
-  echo "     PID: $(cat .prisma-dev.pid)"
+if [[ "$PRISMA_MODE" != "skip" ]]; then
+  echo "  2. Keep Prisma dev running in background:"
+  if [[ -f .prisma-dev.pid ]]; then
+    echo "     PID: $(cat .prisma-dev.pid)"
+    echo "     To stop: kill $(cat .prisma-dev.pid)"
+  fi
+  echo "     To restart: bunx prisma dev"
+  echo ""
+  echo "  3. Start your app:"
 fi
-echo "     (or restart with: bunx prisma dev)"
-echo ""
-echo "  3. Start your app:"
 echo "     npm run dev"
 echo ""
