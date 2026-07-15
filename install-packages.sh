@@ -315,6 +315,16 @@ else
     ok "Prisma already initialized"
 fi
 
+# The client has to exist before the Better Auth CLI runs: it loads
+# app/lib/auth.server.ts, which imports app/generated/prisma/client. Generating
+# from a model-less schema is fine — the models get added below and the client
+# is regenerated at the end.
+if [[ ! -d app/generated/prisma ]]; then
+    log "Generating an initial Prisma client (needed to load auth.server.ts)..."
+    npx prisma generate
+    ok "Initial Prisma client generated"
+fi
+
 # ==============================================================================
 # BETTER AUTH SETUP
 # ==============================================================================
