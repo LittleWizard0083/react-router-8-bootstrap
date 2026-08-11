@@ -611,11 +611,45 @@ fi
 
 mapfile -t prod_missing < <(missing_specs "${prod_deps[@]}")
 
+# @hookform/resolvers declares @typeschema/main as an *optional* peer.
+# @typeschema/main pulls @typeschema/valibot, which pins valibot@^0.39 — and
+# @react-router/dev already brings valibot@^1.4. npm rejects the whole tree over
+# that collision even though @typeschema is never actually installed. Installing
+# it with --legacy-peer-deps skips the phantom peer walk; the resulting tree is
+# identical, and once the package is in the lockfile a plain `npm install`
+# resolves the project normally again. So the flag is scoped to this one install
+# rather than pushed into .npmrc or an "overrides" block.
+legacy_peer_pkgs=(@hookform/resolvers)
+
+needs_legacy_peer() {
+    local name="$1" p
+    for p in "${legacy_peer_pkgs[@]}"; do
+        if [[ "$name" == "$p" ]]; then return 0; fi
+    done
+    return 1
+}
+
+prod_strict=()
+prod_legacy=()
+for spec in "${prod_missing[@]}"; do
+    if needs_legacy_peer "$(spec_name "$spec")"; then
+        prod_legacy+=("$spec")
+    else
+        prod_strict+=("$spec")
+    fi
+done
+
 if [[ ${#prod_missing[@]} -eq 0 ]]; then
     ok "All production dependencies already installed"
 else
     log "Installing ${#prod_missing[@]} production package(s)..."
-    npm install "${prod_missing[@]}"
+    if ((${#prod_strict[@]})); then
+        npm install "${prod_strict[@]}"
+    fi
+    if ((${#prod_legacy[@]})); then
+        log "Installing ${prod_legacy[*]} with --legacy-peer-deps (optional-peer conflict)"
+        npm install --legacy-peer-deps "${prod_legacy[@]}"
+    fi
     ok "Production dependencies installed"
 fi
 
