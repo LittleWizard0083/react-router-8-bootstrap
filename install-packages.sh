@@ -10,15 +10,16 @@
 #   - Keep React / React Router / Vite / Wrangler / Cloudflare Vite plugin exactly
 #     as supplied by the template/package-lock.
 #   - Install all add-on packages from the original installer.
-#   - Standalone add-ons are explicitly upgraded to @latest.
+#   - Standalone add-ons are upgraded to the newest STABLE npm release only.
+#     Pre-releases (rc/beta/alpha/next/canary/preview/dev, etc.) are never selected.
 #   - Version-coupled families are installed together at compatible versions:
 #       * @react-router/fs-routes == installed @react-router/dev
 #       * Prisma CLI/client/adapter share one exact resolved Prisma version
 #       * Lexical core/react share one exact resolved Lexical version
 #
-# Usage:
-#   bash ./install-packages-cloudflare.sh
-#   bash ./install-packages-cloudflare.sh -y   # skip the single confirmation prompt
+# Usage (run as your normal user — DO NOT use sudo):
+#   ./install-packages.sh
+#   ./install-packages.sh -y   # skip the single confirmation prompt
 
 set -euo pipefail
 
@@ -50,6 +51,28 @@ done
 # -----------------------------------------------------------------------------
 # Runtime checks
 # -----------------------------------------------------------------------------
+# Never run this project installer with sudo/root. User-managed Node installs
+# (nvm/fnm/mise/Volta/local PATH) are commonly invisible to sudo, and running
+# npm as root can leave package.json/package-lock.json/node_modules/app files
+# owned by root. System package installation is intentionally outside this script.
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+  echo ""
+  err "Do not run this installer with sudo or as root."
+  if [[ -n ${SUDO_USER:-} && ${SUDO_USER} != "root" ]]; then
+    err "sudo changed the environment from user '${SUDO_USER}' to root, so your normal Node.js PATH may be hidden."
+  fi
+  echo ""
+  echo "  Run it from the project directory as your normal user:"
+  echo ""
+  echo "    node -v"
+  echo "    npm -v"
+  echo "    ./install-packages.sh"
+  echo ""
+  echo "  If node/npm work without sudo, no other change is needed."
+  echo "  This script does not require root privileges."
+  exit 1
+fi
+
 if (( BASH_VERSINFO[0] < 4 )); then
   err "Bash 4+ is required (running ${BASH_VERSION})."
   exit 1
@@ -57,7 +80,8 @@ fi
 
 for bin in node npm; do
   if ! command -v "$bin" >/dev/null 2>&1; then
-    err "$bin is not available on PATH. Install Node.js/npm first."
+    err "$bin is not available on your normal user PATH."
+    err "Install/activate Node.js for your user first, then rerun this script WITHOUT sudo."
     exit 1
   fi
 done
@@ -163,8 +187,40 @@ fi
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-latest_version() {
-  npm view "$1" version --silent
+# Return the highest published stable semantic version for an npm package.
+# We intentionally do NOT trust the `latest` dist-tag blindly because a publisher
+# can point any dist-tag at a prerelease. Stable here means an exact x.y.z version
+# with no SemVer prerelease suffix (for example: -rc.1, -beta.2, -next, -canary).
+stable_version() {
+  local package="$1"
+  npm view "$package" versions --json 2>/dev/null | node -e '
+let input = "";
+process.stdin.on("data", (d) => input += d);
+process.stdin.on("end", () => {
+  let versions;
+  try { versions = JSON.parse(input); } catch { process.exit(2); }
+  if (!Array.isArray(versions)) versions = [versions];
+
+  const stable = versions
+    .filter((v) => typeof v === "string" && /^\d+\.\d+\.\d+(?:\+[0-9A-Za-z.-]+)?$/.test(v))
+    .sort((a, b) => {
+      const pa = a.split("+")[0].split(".").map(Number);
+      const pb = b.split("+")[0].split(".").map(Number);
+      return pa[0] - pb[0] || pa[1] - pb[1] || pa[2] - pb[2];
+    });
+
+  if (!stable.length) process.exit(3);
+  process.stdout.write(stable[stable.length - 1]);
+});
+'
+}
+
+assert_stable_version() {
+  local package="$1" version="$2"
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$ ]]; then
+    err "Refusing prerelease/non-stable version for ${package}: ${version}"
+    exit 1
+  fi
 }
 
 installed_version() {
@@ -188,75 +244,114 @@ ok "@react-router/fs-routes pinned to ${RR_VERSION}"
 # Prisma family — resolve once, keep CLI/client/adapter synchronized
 # -----------------------------------------------------------------------------
 log "Resolving the current Prisma release for the synchronized Prisma family..."
-PRISMA_VERSION="$(latest_version prisma)"
+PRISMA_VERSION="$(stable_version prisma)"
 if [[ -z "$PRISMA_VERSION" ]]; then
-  err "Could not resolve the Prisma version from npm."
+  err "Could not resolve a stable Prisma version from npm."
   exit 1
 fi
+assert_stable_version prisma "$PRISMA_VERSION"
 
-log "Installing synchronized Prisma ${PRISMA_VERSION} packages..."
+PG_VERSION="$(stable_version pg)"
+PG_TYPES_VERSION="$(stable_version @types/pg)"
+[[ -n "$PG_VERSION" && -n "$PG_TYPES_VERSION" ]] || { err "Could not resolve stable PostgreSQL package versions."; exit 1; }
+assert_stable_version pg "$PG_VERSION"
+assert_stable_version @types/pg "$PG_TYPES_VERSION"
+
+log "Installing synchronized stable Prisma ${PRISMA_VERSION} packages..."
 npm install \
   "@prisma/client@${PRISMA_VERSION}" \
   "@prisma/adapter-pg@${PRISMA_VERSION}" \
-  "pg@latest"
+  "pg@${PG_VERSION}"
 npm install --save-dev \
   "prisma@${PRISMA_VERSION}" \
-  "@types/pg@latest"
+  "@types/pg@${PG_TYPES_VERSION}"
 ok "Prisma family installed at ${PRISMA_VERSION}"
 
 # -----------------------------------------------------------------------------
 # Lexical family — keep core and React integration synchronized
 # -----------------------------------------------------------------------------
 log "Resolving the current Lexical release..."
-LEXICAL_VERSION="$(latest_version lexical)"
+LEXICAL_VERSION="$(stable_version lexical)"
 if [[ -z "$LEXICAL_VERSION" ]]; then
-  err "Could not resolve the Lexical version from npm."
+  err "Could not resolve a stable Lexical version from npm."
   exit 1
 fi
+assert_stable_version lexical "$LEXICAL_VERSION"
 
-log "Installing synchronized Lexical ${LEXICAL_VERSION} packages..."
+log "Installing synchronized stable Lexical ${LEXICAL_VERSION} packages..."
 npm install "lexical@${LEXICAL_VERSION}" "@lexical/react@${LEXICAL_VERSION}"
 ok "Lexical family installed at ${LEXICAL_VERSION}"
 
 # -----------------------------------------------------------------------------
-# Independent add-ons — explicitly keep these at @latest
+# Independent add-ons — newest STABLE releases only
 # -----------------------------------------------------------------------------
-LATEST_PROD=(
-  better-auth@latest
-  resend@latest
-  stripe@latest
-  zod@latest
-  react-hook-form@latest
-  dompurify@latest
-  motion@latest
-  three@latest
+STABLE_PROD_PACKAGES=(
+  better-auth
+  resend
+  stripe
+  zod
+  react-hook-form
+  dompurify
+  motion
+  three
 )
 
-LATEST_DEV=(
-  tsx@latest
-  jsdom@latest
-  @types/three@latest
-  daisyui@latest
+STABLE_DEV_PACKAGES=(
+  tsx
+  jsdom
+  @types/three
+  daisyui
 )
 
-log "Installing/upgrading independent production add-ons to @latest..."
-npm install "${LATEST_PROD[@]}"
-ok "Independent production add-ons are current"
+install_stable_packages() {
+  local save_mode="$1"
+  shift
+  local package version specs=()
+
+  for package in "$@"; do
+    log "Resolving newest stable ${package} release..."
+    version="$(stable_version "$package")"
+    if [[ -z "$version" ]]; then
+      err "Could not resolve a stable version for ${package}."
+      exit 1
+    fi
+    assert_stable_version "$package" "$version"
+    log "Selected ${package}@${version}"
+    specs+=("${package}@${version}")
+  done
+
+  if [[ "$save_mode" == "dev" ]]; then
+    npm install --save-dev "${specs[@]}"
+  else
+    npm install "${specs[@]}"
+  fi
+}
+
+log "Installing/upgrading independent production add-ons to newest stable releases..."
+install_stable_packages prod "${STABLE_PROD_PACKAGES[@]}"
+ok "Independent production add-ons are on stable releases"
 
 # @hookform/resolvers has historically had optional-peer resolution collisions.
-# Try normal npm peer validation first; use the narrow fallback only if needed.
-log "Installing/upgrading @hookform/resolvers@latest..."
-if npm install @hookform/resolvers@latest; then
+# Resolve its newest stable release first; use the narrow peer fallback only if needed.
+HOOKFORM_RESOLVERS_VERSION="$(stable_version @hookform/resolvers)"
+if [[ -z "$HOOKFORM_RESOLVERS_VERSION" ]]; then
+  err "Could not resolve a stable @hookform/resolvers version."
+  exit 1
+fi
+assert_stable_version @hookform/resolvers "$HOOKFORM_RESOLVERS_VERSION"
+
+log "Installing/upgrading @hookform/resolvers@${HOOKFORM_RESOLVERS_VERSION}..."
+if npm install "@hookform/resolvers@${HOOKFORM_RESOLVERS_VERSION}"; then
   ok "@hookform/resolvers installed with normal peer validation"
 else
   warn "Normal peer resolution failed; retrying only this package with --legacy-peer-deps"
-  npm install --legacy-peer-deps @hookform/resolvers@latest
+  npm install --legacy-peer-deps "@hookform/resolvers@${HOOKFORM_RESOLVERS_VERSION}"
   ok "@hookform/resolvers installed with the compatibility fallback"
 fi
 
-log "Installing/upgrading independent development add-ons to @latest..."
-npm install --save-dev "${LATEST_DEV[@]}"
-ok "Independent development add-ons are current"
+log "Installing/upgrading independent development add-ons to newest stable releases..."
+install_stable_packages dev "${STABLE_DEV_PACKAGES[@]}"
+ok "Independent development add-ons are on stable releases"
 
 warn "jsdom is intentionally a dev dependency: it is Node-only and must not be imported into Worker runtime code."
 
@@ -464,12 +559,19 @@ NODE
   fi
 fi
 
-# Better Auth currently documents npx auth@latest generate.
+# Better Auth CLI: resolve an exact stable version instead of using auth@latest.
 if grep -qE '^model (User|user) ' prisma/schema.prisma 2>/dev/null; then
   ok "Better Auth models already exist in prisma/schema.prisma"
 else
-  log "Generating Better Auth Prisma schema..."
-  NPX --yes auth@latest generate \
+  log "Resolving newest stable Better Auth CLI release..."
+  AUTH_CLI_VERSION="$(stable_version auth)"
+  if [[ -z "$AUTH_CLI_VERSION" ]]; then
+    err "Could not resolve a stable Better Auth CLI (auth) version."
+    exit 1
+  fi
+  assert_stable_version auth "$AUTH_CLI_VERSION"
+  log "Generating Better Auth Prisma schema with auth@${AUTH_CLI_VERSION}..."
+  NPX --yes "auth@${AUTH_CLI_VERSION}" generate \
     --config app/lib/auth.server.ts \
     --output prisma/schema.prisma \
     --yes
@@ -508,6 +610,10 @@ let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>{try{proc
   [[ -n "$tag" ]] || { warn "Could not resolve Stripe CLI release."; return 0; }
 
   version="${tag#v}"
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$ ]]; then
+    warn "Stripe CLI latest release is not a plain stable SemVer (${tag}); skipping it."
+    return 0
+  fi
   url="https://github.com/stripe/stripe-cli/releases/download/${tag}/stripe_${version}_linux_${arch}.tar.gz"
   tmp="$(mktemp -d)"
   dest="${HOME}/.local/bin"
@@ -543,7 +649,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo -e "${GREEN}✅ Add-on installation complete.${RESET}"
 echo ""
 echo "Template packages were left under the versions selected by the Cloudflare template."
-echo "Standalone add-ons were requested with @latest; coupled package families were synchronized."
+echo "Add-on packages were resolved to exact newest stable releases; prereleases were excluded."
 echo ""
 echo "Next steps:"
 echo "  1. Set a real DATABASE_URL in .env and .dev.vars."
