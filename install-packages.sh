@@ -14,12 +14,19 @@
 #     Pre-releases (rc/beta/alpha/next/canary/preview/dev, etc.) are never selected.
 #   - Version-coupled families are installed together at compatible versions:
 #       * @react-router/fs-routes == installed @react-router/dev
-#       * Prisma CLI/client/adapter share one exact resolved Prisma version
+#       * Prisma CLI/client/adapter-pg/adapter-d1 share one exact Prisma version
 #       * Lexical core/react share one exact resolved Lexical version
+#   - --upgrade-template (opt-in) also moves template-owned packages to their
+#     newest stable releases. TypeScript and @types/node are still held: a new
+#     TypeScript major and Node types newer than your Node runtime break builds.
+#   - A version report runs at the end: installed vs newest stable, per package.
 #
 # Usage (run as your normal user — DO NOT use sudo):
-#   ./install-packages.sh
-#   ./install-packages.sh -y   # skip the single confirmation prompt
+#   ./install-packages-cloudflare.sh
+#   ./install-packages-cloudflare.sh -y                  # skip the confirmation prompt
+#   ./install-packages-cloudflare.sh --upgrade-template  # also upgrade template packages
+#   ./install-packages-cloudflare.sh --report            # only print the version report
+# (end of help text)
 
 set -euo pipefail
 
@@ -37,11 +44,15 @@ warn() { echo -e "  ${YELLOW}▲${RESET}  $1"; }
 err()  { echo -e "  ${RED}✖${RESET}  $1" >&2; }
 
 ASSUME_YES=0
+UPGRADE_TEMPLATE=0
+REPORT_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     -y|--yes) ASSUME_YES=1 ;;
+    --upgrade-template) UPGRADE_TEMPLATE=1 ;;
+    --report) REPORT_ONLY=1; ASSUME_YES=1 ;;
     -h|--help)
-      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,/(end of help text)/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) err "Unknown argument: $arg"; exit 1 ;;
@@ -66,7 +77,7 @@ if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
   echo ""
   echo "    node -v"
   echo "    npm -v"
-  echo "    ./install-packages.sh"
+  echo "    ./install-packages-cloudflare.sh"
   echo ""
   echo "  If node/npm work without sudo, no other change is needed."
   echo "  This script does not require root privileges."
@@ -227,6 +238,115 @@ installed_version() {
   node -e "try{process.stdout.write(require('./node_modules/$1/package.json').version||'')}catch(e){}"
 }
 
+# Resolve "package@<newest stable>" or abort.
+resolve_spec() {
+  local package="$1" version
+  version="$(stable_version "$package" || true)"
+  if [[ -z "$version" ]]; then
+    err "Could not resolve a stable version for ${package}."
+    exit 1
+  fi
+  assert_stable_version "$package" "$version"
+  printf '%s@%s' "$package" "$version"
+}
+
+# Fail early if a lock-step partner was not published at the same version.
+assert_published() {
+  local package="$1" version="$2"
+  if [[ -z "$(npm view "${package}@${version}" version 2>/dev/null)" ]]; then
+    err "${package}@${version} is not published; cannot keep it in lock-step."
+    exit 1
+  fi
+}
+
+# Every package the finished project is expected to carry, with its owner.
+# template = created by the Cloudflare template (held unless --upgrade-template)
+# held     = template-owned and held even with --upgrade-template
+# addon    = installed by this script
+REPORT_PACKAGES=(
+  "react:template" "react-dom:template" "react-router:template" "isbot:template"
+  "@react-router/dev:template" "@cloudflare/vite-plugin:template" "vite:template"
+  "wrangler:template" "tailwindcss:template" "@tailwindcss/vite:template"
+  "@types/react:template" "@types/react-dom:template"
+  "typescript:held" "@types/node:held"
+  "@react-router/fs-routes:addon" "@prisma/client:addon" "@prisma/adapter-pg:addon"
+  "@prisma/adapter-d1:addon" "prisma:addon" "pg:addon" "@types/pg:addon"
+  "lexical:addon" "@lexical/react:addon" "better-auth:addon" "resend:addon"
+  "stripe:addon" "zod:addon" "react-hook-form:addon" "@hookform/resolvers:addon"
+  "dompurify:addon" "motion:addon" "three:addon" "@types/three:addon"
+  "lucide-react:addon" "tsx:addon" "jsdom:addon" "daisyui:addon" "sharp:addon"
+)
+
+version_report() {
+  local entry package owner installed latest status
+  echo ""
+  echo -e "${BOLD}Version report — installed vs newest stable on npm${RESET}"
+  printf "  %-26s %-10s %-12s %-12s %s\n" "PACKAGE" "OWNER" "INSTALLED" "LATEST" "STATUS"
+  for entry in "${REPORT_PACKAGES[@]}"; do
+    package="${entry%%:*}"
+    owner="${entry##*:}"
+    installed="$(installed_version "$package")"
+    latest="$(stable_version "$package" || true)"
+    if [[ -z "$installed" ]]; then
+      status="${RED}missing${RESET}"
+    elif [[ "$installed" == "$latest" ]]; then
+      status="${GREEN}latest${RESET}"
+    elif [[ "$package" == "@react-router/fs-routes" ]]; then
+      status="${YELLOW}pinned to @react-router/dev${RESET}"
+    elif [[ "$owner" != "addon" ]]; then
+      status="${DIM}held by template${RESET}"
+    else
+      status="${YELLOW}behind${RESET}"
+    fi
+    printf "  %-26s %-10s %-12s %-12s " "$package" "$owner" "${installed:--}" "${latest:-?}"
+    echo -e "$status"
+  done
+  echo ""
+}
+
+if (( REPORT_ONLY == 1 )); then
+  version_report
+  exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Optional: upgrade template-owned packages (--upgrade-template only)
+# -----------------------------------------------------------------------------
+if (( UPGRADE_TEMPLATE == 1 )); then
+  warn "--upgrade-template: moving template-owned packages to their newest stable releases."
+  warn "TypeScript and @types/node are intentionally held at the template's versions."
+
+  REACT_SPEC="$(resolve_spec react)"
+  REACT_TARGET="${REACT_SPEC##*@}"
+  assert_published react-dom "$REACT_TARGET"
+
+  RR_SPEC="$(resolve_spec react-router)"
+  RR_TARGET="${RR_SPEC##*@}"
+  assert_published @react-router/dev "$RR_TARGET"
+
+  TW_SPEC="$(resolve_spec tailwindcss)"
+  TW_TARGET="${TW_SPEC##*@}"
+  assert_published @tailwindcss/vite "$TW_TARGET"
+
+  log "react/react-dom ${REACT_TARGET}, react-router/@react-router/dev ${RR_TARGET}, tailwindcss/@tailwindcss/vite ${TW_TARGET}"
+
+  npm install \
+    "react@${REACT_TARGET}" \
+    "react-dom@${REACT_TARGET}" \
+    "react-router@${RR_TARGET}" \
+    "$(resolve_spec isbot)"
+  npm install --save-dev \
+    "@react-router/dev@${RR_TARGET}" \
+    "tailwindcss@${TW_TARGET}" \
+    "@tailwindcss/vite@${TW_TARGET}" \
+    "$(resolve_spec vite)" \
+    "$(resolve_spec wrangler)" \
+    "$(resolve_spec @cloudflare/vite-plugin)" \
+    "$(resolve_spec @types/react)" \
+    "$(resolve_spec @types/react-dom)"
+  ok "Template-owned packages upgraded to newest stable releases"
+fi
+
 # -----------------------------------------------------------------------------
 # React Router companion package — MUST match the installed template
 # -----------------------------------------------------------------------------
@@ -257,10 +377,16 @@ PG_TYPES_VERSION="$(stable_version @types/pg)"
 assert_stable_version pg "$PG_VERSION"
 assert_stable_version @types/pg "$PG_TYPES_VERSION"
 
+assert_published @prisma/adapter-pg "$PRISMA_VERSION"
+assert_published @prisma/adapter-d1 "$PRISMA_VERSION"
+
+# @prisma/adapter-pg → PostgreSQL via DATABASE_URL (used by Better Auth below).
+# @prisma/adapter-d1 → Cloudflare D1 binding (add a d1_databases entry in wrangler.jsonc to use it).
 log "Installing synchronized stable Prisma ${PRISMA_VERSION} packages..."
 npm install \
   "@prisma/client@${PRISMA_VERSION}" \
   "@prisma/adapter-pg@${PRISMA_VERSION}" \
+  "@prisma/adapter-d1@${PRISMA_VERSION}" \
   "pg@${PG_VERSION}"
 npm install --save-dev \
   "prisma@${PRISMA_VERSION}" \
@@ -294,6 +420,7 @@ STABLE_PROD_PACKAGES=(
   dompurify
   motion
   three
+  lucide-react   # tree-shakeable SVG icon components (import { Icon } from "lucide-react")
 )
 
 STABLE_DEV_PACKAGES=(
@@ -301,6 +428,7 @@ STABLE_DEV_PACKAGES=(
   jsdom
   @types/three
   daisyui
+  sharp   # native Node image processing for build/scripts — never import it in Worker code
 )
 
 install_stable_packages() {
@@ -331,6 +459,14 @@ log "Installing/upgrading independent production add-ons to newest stable releas
 install_stable_packages prod "${STABLE_PROD_PACKAGES[@]}"
 ok "Independent production add-ons are on stable releases"
 
+# lucide-react declares React as a peer dependency; confirm it resolved cleanly
+# against the template's React version (no forced React upgrade happens here).
+if [[ -n "$(installed_version lucide-react)" ]]; then
+  ok "lucide-react $(installed_version lucide-react) installed against React $(installed_version react)"
+else
+  warn "lucide-react does not appear in node_modules; check the npm output above."
+fi
+
 # @hookform/resolvers has historically had optional-peer resolution collisions.
 # Resolve its newest stable release first; use the narrow peer fallback only if needed.
 HOOKFORM_RESOLVERS_VERSION="$(stable_version @hookform/resolvers)"
@@ -353,7 +489,7 @@ log "Installing/upgrading independent development add-ons to newest stable relea
 install_stable_packages dev "${STABLE_DEV_PACKAGES[@]}"
 ok "Independent development add-ons are on stable releases"
 
-warn "jsdom is intentionally a dev dependency: it is Node-only and must not be imported into Worker runtime code."
+warn "jsdom and sharp are intentionally dev dependencies: both are Node-only and must not be imported into Worker runtime code."
 
 # -----------------------------------------------------------------------------
 # daisyUI / Tailwind CSS 4 integration
@@ -644,11 +780,18 @@ fi
 log "Checking direct dependency tree..."
 npm list --depth=0 || warn "npm reported dependency-tree warnings; review the output above."
 
+version_report
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo -e "${GREEN}✅ Add-on installation complete.${RESET}"
 echo ""
-echo "Template packages were left under the versions selected by the Cloudflare template."
+if (( UPGRADE_TEMPLATE == 1 )); then
+  echo "Template packages were upgraded to newest stable (TypeScript and @types/node held)."
+else
+  echo "Template packages were left at the versions selected by the Cloudflare template."
+  echo "Rerun with --upgrade-template to move them to newest stable as well."
+fi
 echo "Add-on packages were resolved to exact newest stable releases; prereleases were excluded."
 echo ""
 echo "Next steps:"
